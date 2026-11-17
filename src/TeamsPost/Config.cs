@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 using PyCompat;
+using Tomlyn;
 using Tomlyn.Model;
 
 namespace TeamsPost;
@@ -58,6 +59,7 @@ public sealed partial class Config
     // Explicit "\n" (a raw literal would take the .cs file's line endings), written with CRLF.
     public const string Template =
         "# teams-post settings. See the README.\n" +
+        "# base = \"base-config.toml\"        # settings shared with other tools\n" +
         "# login_hint = \"you@example.com\"\n" +
         "# tenant = \"organizations\"          # or your organisation's tenant id\n" +
         "# msal_cache = \"...\"                # another tool's token cache, to share its sign-in\n" +
@@ -71,8 +73,11 @@ public sealed partial class Config
         "# chat = \"19:0123456789abcdef0123456789abcdef@thread.v2\"\n" +
         "# mention = \"everyone\"              # optional: start the post with @Everyone\n";
 
-    private static readonly string[] TopKeys =
+    /// <summary>Every top-level setting: the strict check's list, and what a base file may supply.</summary>
+    public static readonly string[] KnownKeys =
         ["login_hint", "tenant", "msal_cache", "state_file", "log_file", "draft_marker", "strip_frontmatter", "target"];
+
+    private static readonly string[] TopKeys = KnownKeys;
 
     private static readonly string[] TargetKeys = ["chat", "channel", "mention"];
 
@@ -134,7 +139,17 @@ public sealed partial class Config
             var text = PyStr.ReadText(full);
             if (text.StartsWith('﻿'))
                 text = text[1..];
-            raw = PyToml.Read(text, full);
+            var read = BaseSettings.Read(text, full, env, KnownKeys);
+            raw = read.Raw;
+            env = read.Env;   // the base's [paths], then the environment
+        }
+        catch (TomlException error)
+        {
+            throw new UsageException($"{full}: {error.Message.TrimEnd()}");
+        }
+        catch (FormatException error)   // the base file: the message names it
+        {
+            throw new UsageException(error.Message.TrimEnd());
         }
         catch (Exception error) when (error is not (IOException or UnauthorizedAccessException or UsageException))
         {

@@ -42,12 +42,26 @@ edit, because it's the only delegated permission Graph accepts for changing a ch
 organisations need an admin to approve one or more of these: the sign-in shows an "Approval
 required" screen, where you can ask. Only the person who posted a message can edit it.
 
+## Sharing settings with other tools: `base`
+
+Several tools built on the shared library can keep their common settings in one file, named at the top of each
+tool's settings: `base = "base-config.toml"` (relative to the settings file). Then:
+
+- **the base's `[paths]` are variables** for this tool's paths, looked up before the environment: with
+  `EA_LOCAL = "%LOCALAPPDATA%/claude-ea"` there, `state_file = "%EA_LOCAL%/teams-post.json"` works here;
+- **its other settings that teams-post knows and this file doesn't set are used**, typically `login_hint`, `tenant`
+  and `msal_cache`;
+- **a table such as `[target]` applies only if this file has that section too**, its own entries winning.
+
+The loader is background-tools-lib's `PyCompat.BaseSettings`.
+
 ## Settings
 
 `%APPDATA%\teams-post\config.toml` by default (`--config <file>`, before the command, or
 `TEAMS_POST_CONFIG` for another).
 
 ```toml
+base = "base-config.toml"   # optional: settings shared with other tools
 login_hint = "you@example.com"
 tenant = "organizations"            # or a tenant id
 msal_cache = "..."                  # optional: share another tool's sign-in cache
