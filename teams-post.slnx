@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="src/TeamsPost/TeamsPost.csproj" />
+  <Project Path="src/TeamsPost.Console/TeamsPost.Console.csproj" />
+
+  <Project Path="tests/TeamsPost.Tests/TeamsPost.Tests.csproj" />
+</Solution>
