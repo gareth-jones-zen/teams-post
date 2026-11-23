@@ -46,7 +46,9 @@ public sealed class DeliveryUnknownException(string message, Exception? inner = 
 ///
 /// Writes go through SendRawAsync with GraphRetryPolicy.Write: sent again only after a 429 (refused before it was
 /// looked at) or a connection that never opened. A timeout, a dropped connection after sending or a 5xx may have
-/// been applied, so it's never resent; it becomes DeliveryUnknownException. Reads are retried as usual.</summary>
+/// been applied, so it's never resent: M365Graph throws GraphDeliveryUnknownException, which becomes
+/// DeliveryUnknownException. A 4xx is a refusal (GraphRefusedException): nothing changed. Reads (GET) are retried
+/// on a 429, a 5xx or a dropped connection.</summary>
 public sealed class TeamsChat(GraphClient graph)
 {
     public static readonly string[] SendScopes = ["ChatMessage.Send"];

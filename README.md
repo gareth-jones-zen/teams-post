@@ -158,8 +158,11 @@ That's exactly how Teams stores an @Everyone typed by hand, so everyone in the c
   it was looked at) or a connection that never opened. After a timeout, a dropped connection or a
   5xx it may have been applied, so it isn't resent: the run stops, says so, and exits 1. A post whose
   answer was lost is recorded as `unknown`, so the next `post` of that file is refused until you've
-  looked (`show`). An edit whose answer was lost leaves its record as it was; `show <target> <id>`
-  tells you whether it landed. Reads are retried as usual.
+  looked (`show`). An edit whose answer was lost is recorded as unconfirmed (`edit_unknown`, the
+  SHA-256 of what was sent) and `show <target> <id>` tells you whether it landed; the next `edit`
+  of that file reads the message first, and if it already reads as the file, records the edit as
+  done and sends nothing. A 4xx is a refusal: nothing changed and nothing is recorded. Reads are
+  retried after a 429, a 5xx or a dropped connection (three tries in all).
 - **Every post and edit is read back.** The message must have the same number of list items and
   paragraphs as was sent, and the @Everyone mention when one was sent; otherwise it says what differs
   and exits 1. A message just posted can answer "not found" for a moment, so the read waits a few

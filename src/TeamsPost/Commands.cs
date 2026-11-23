@@ -207,6 +207,15 @@ public static partial class Commands
         var oldLines = PlainText.Lines(current.Html);
         var newLines = PlainText.Lines(html);
         var sha = PostStore.Hash(html);
+        if (record is not null && record.EditUnknown == sha && oldLines.SequenceEqual(newLines))
+        {
+            // the edit sent last time, whose answer never came, did land: record it rather than send it again
+            session.Store.Upsert(record with { File = full, Sha256 = sha, EditedAt = Stamp(session.Now()), EditUnknown = null });
+            session.Log($"edit {target.Name} {messageId}: the unconfirmed edit landed");
+            session.Out.WriteLine($"Message {messageId} in {target.Name} already reads as {Path.GetFileName(full)}: "
+                + "the earlier edit, whose answer never came, landed. Nothing sent.");
+            return 0;
+        }
         if (oldLines.SequenceEqual(newLines) && (record is null || record.Sha256 == sha))
         {
             session.Out.WriteLine($"Message {messageId} in {target.Name} already reads as {Path.GetFileName(full)}: nothing to change.");
@@ -232,6 +241,8 @@ public static partial class Commands
         }
         catch (DeliveryUnknownException error)
         {
+            if (record is not null)
+                session.Store.Upsert(record with { EditUnknown = sha });
             session.Log($"edit {target.Name} {messageId}: no answer ({error.Message})");
             session.Out.WriteLine($"No answer from Teams: {error.Message}");
             session.Out.WriteLine($"The edit may have been applied, so it wasn't sent again. Check with: teams-post show {target.Name} {messageId}");
@@ -249,7 +260,7 @@ public static partial class Commands
         var editedAt = Stamp(session.Now());
         session.Store.Upsert(record is null
             ? new PostRecord(full, target.Name, chatId, messageId, current.Created, sha, "posted", editedAt, editedAt)
-            : record with { File = full, Sha256 = sha, EditedAt = editedAt });
+            : record with { File = full, Sha256 = sha, EditedAt = editedAt, EditUnknown = null });
         session.Log($"edited {target.Name} {messageId} from {full}");
         session.Out.WriteLine($"Edited {messageId}.");
         return ReadBack(session, chat, target.Name, chatId, messageId, html, target.Mention);

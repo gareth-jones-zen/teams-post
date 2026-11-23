@@ -126,6 +126,36 @@ public class PostTests
         Assert.Equal(1, env.Run("post", "marketing", env.MessageFile, "--yes"));
         Assert.Equal(1, env.Teams.Writes);
         Assert.Equal("unknown", Assert.Single(env.Records).Status);
+        Assert.Contains("may have been posted, so it wasn't sent again", env.Out.ToString());
+
+        // and the next run doesn't send it again either
+        Assert.Equal(1, env.Run("post", "marketing", env.MessageFile, "--yes"));
+        Assert.Equal(1, env.Teams.Writes);
+        Assert.Contains("no answer came back", env.Out.ToString());
+    }
+
+    [Fact]
+    public void A_timeout_after_sending_is_not_resent_and_is_recorded_as_unknown()
+    {
+        using var env = new Env();
+        env.Teams.TimeOutNextWrite = true;
+        Assert.Equal(1, env.Run("post", "marketing", env.MessageFile, "--yes"));
+        Assert.Equal(1, env.Teams.Writes);
+        Assert.Single(env.Teams.Messages);   // it did land
+        Assert.Equal("unknown", Assert.Single(env.Records).Status);
+        Assert.Contains("wasn't sent again", env.Out.ToString());
+        Assert.Contains("teams-post show marketing", env.Out.ToString());
+    }
+
+    [Fact]
+    public void A_5xx_on_the_read_back_is_retried()
+    {
+        using var env = new Env();
+        env.Teams.FailNextRead = HttpStatusCode.ServiceUnavailable;
+        Assert.Equal(0, env.Run("post", "marketing", env.MessageFile, "--yes"));
+        Assert.Equal(1, env.Teams.Writes);
+        Assert.Equal(2, env.Teams.Requests.Count(r => r.Method == "GET"));
+        Assert.Contains("Read back OK.", env.Out.ToString());
     }
 
     [Fact]
@@ -292,6 +322,47 @@ public class EditTests
         env.Teams.AppliedButAnswered = HttpStatusCode.BadGateway;
         Assert.Equal(1, env.Run("edit", env.MessageFile, "--yes"));
         Assert.Single(env.Teams.Requests, r => r.Method == "PATCH");
+        Assert.Contains("may have been applied, so it wasn't sent again", env.Out.ToString());
+        Assert.Null(env.Records[0].EditedAt);
+    }
+
+    [Fact]
+    public void A_timeout_after_sending_is_not_resent_and_the_next_run_finds_it_landed()
+    {
+        using var env = Posted();
+        env.Teams.TimeOutNextWrite = true;
+        Assert.Equal(1, env.Run("edit", env.MessageFile, "--yes"));
+        Assert.Single(env.Teams.Requests, r => r.Method == "PATCH");
+        Assert.Contains("wasn't sent again", env.Out.ToString());
+
+        var record = Assert.Single(env.Records);
+        Assert.NotNull(record.EditUnknown);
+        Assert.Null(record.EditedAt);
+
+        // the next run reads the message first: the edit landed, so it's recorded and nothing is sent
+        Assert.Equal(0, env.Run("edit", env.MessageFile, "--yes"));
+        Assert.Contains("landed. Nothing sent.", env.Out.ToString());
+        Assert.Single(env.Teams.Requests, r => r.Method == "PATCH");
+        record = Assert.Single(env.Records);
+        Assert.Equal(record.Sha256, PostStore.Hash(env.Teams.Messages[0].Html));
+        Assert.Null(record.EditUnknown);
+        Assert.NotNull(record.EditedAt);
+    }
+
+    [Fact]
+    public void An_unconfirmed_edit_that_didnt_land_can_be_sent_again()
+    {
+        using var env = Posted();
+        env.Teams.FailNextWrite = HttpStatusCode.ServiceUnavailable;   // a 5xx, and nothing applied
+        Assert.Equal(1, env.Run("edit", env.MessageFile, "--yes"));
+        Assert.Contains("wasn't sent again", env.Out.ToString());
+        Assert.NotNull(env.Records[0].EditUnknown);
+
+        // the message still reads as before, so the preview shows the change, and --yes sends it
+        Assert.Equal(0, env.Run("edit", env.MessageFile, "--yes"));
+        Assert.Equal(2, env.Teams.Requests.Count(r => r.Method == "PATCH"));
+        Assert.Null(env.Records[0].EditUnknown);
+        Assert.Contains("Read back OK.", env.Out.ToString());
     }
 
     [Fact]
@@ -420,6 +491,17 @@ public class ShowTests
         Assert.Equal(0, env.Run("show", "general", message.Id));
         Assert.Contains($"{message.Id}  ", env.Out.ToString());
         Assert.Contains("  @Everyone hi", env.Out.ToString());
+    }
+
+    [Fact]
+    public void A_5xx_on_a_read_is_retried()
+    {
+        using var env = new Env();
+        env.Teams.Add(Env.Marketing, "<p>first</p>");
+        env.Teams.FailNextRead = HttpStatusCode.BadGateway;
+        Assert.Equal(0, env.Run("show", "marketing"));
+        Assert.Equal(2, env.Teams.Requests.Count(r => r.Method == "GET"));
+        Assert.Contains("first", env.Out.ToString());
     }
 
     [Fact]

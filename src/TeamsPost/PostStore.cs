@@ -6,9 +6,10 @@ using System.Text.Json.Nodes;
 namespace TeamsPost;
 
 /// <summary>One post teams-post made (or tried to). Status "posted": it landed and Id is the message. Status
-/// "unknown": the post was sent but no answer came back, so it may be in the chat; Id is null.</summary>
+/// "unknown": the post was sent but no answer came back, so it may be in the chat; Id is null. EditUnknown: the
+/// SHA-256 of an edit that was sent but not confirmed (no answer, or a 5xx), so the next edit can tell it landed.</summary>
 public sealed record PostRecord(string File, string Target, string Chat, string? Id, string? Created, string Sha256,
-    string Status, string PostedAt, string? EditedAt = null)
+    string Status, string PostedAt, string? EditedAt = null, string? EditUnknown = null)
 {
     public bool Landed => Status == "posted" && !string.IsNullOrEmpty(Id);
 }
@@ -55,7 +56,7 @@ public sealed class PostStore(string path)
         {
             string? Text(string key) => item?[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
             records.Add(new PostRecord(Text("file") ?? "", Text("target") ?? "", Text("chat") ?? "", Text("id"), Text("created"),
-                Text("sha256") ?? "", Text("status") ?? "posted", Text("posted_at") ?? "", Text("edited_at")));
+                Text("sha256") ?? "", Text("status") ?? "posted", Text("posted_at") ?? "", Text("edited_at"), Text("edit_unknown")));
         }
         return records;
     }
@@ -78,6 +79,8 @@ public sealed class PostStore(string path)
             };
             if (r.EditedAt is not null)
                 item["edited_at"] = r.EditedAt;
+            if (r.EditUnknown is not null)
+                item["edit_unknown"] = r.EditUnknown;
             array.Add((JsonNode)item);
         }
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(Path))!);

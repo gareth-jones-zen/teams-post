@@ -29,6 +29,12 @@ public sealed partial class FakeTeams : HttpMessageHandler
     /// <summary>The next write is applied, then its answer is lost (a dropped connection).</summary>
     public bool LoseNextWrite { get; set; }
 
+    /// <summary>The next write is applied, then the request times out before the answer comes.</summary>
+    public bool TimeOutNextWrite { get; set; }
+
+    /// <summary>The next GET gets this status (Graph having a bad moment), and nothing is read.</summary>
+    public HttpStatusCode? FailNextRead { get; set; }
+
     /// <summary>The next write gets this status, and isn't applied.</summary>
     public HttpStatusCode? FailNextWrite { get; set; }
 
@@ -87,6 +93,11 @@ public sealed partial class FakeTeams : HttpMessageHandler
 
         if (request.Method == HttpMethod.Get)
         {
+            if (FailNextRead is { } failRead)
+            {
+                FailNextRead = null;
+                return Json(failRead, new JsonObject { ["error"] = "unavailable (fake)" });
+            }
             if (id is null)
             {
                 var top = int.Parse(Regex.Match(uri.Query, @"\$top=(\d+)").Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
@@ -134,6 +145,11 @@ public sealed partial class FakeTeams : HttpMessageHandler
         {
             LoseNextWrite = false;
             throw new IOException("connection reset (fake)");
+        }
+        if (TimeOutNextWrite)
+        {
+            TimeOutNextWrite = false;
+            throw new TaskCanceledException("timed out (fake)", new TimeoutException("the answer never came (fake)"));
         }
         if (AppliedButAnswered is { } status)
         {
