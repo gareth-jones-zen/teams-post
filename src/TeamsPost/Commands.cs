@@ -166,7 +166,13 @@ public static partial class Commands
         }
         else
         {
-            var records = session.Store.Load().Where(r => PostStore.SameFile(r.File, full)).ToList();
+            var all = session.Store.Load().Where(r => PostStore.SameFile(r.File, full)).ToList();
+            var records = all.Where(r => r.Target != ReplyTarget).ToList();
+            if (records.Count == 0 && all.Count > 0)
+            {
+                session.Out.WriteLine($"{full} was sent as a reply (teams-post reply), and replies can't be edited by teams-post yet.");
+                return 1;
+            }
             if (targetName is not null)
                 records = records.Where(r => r.Target == targetName).ToList();
             var landed = records.Where(r => r.Landed).ToList();
@@ -266,11 +272,18 @@ public static partial class Commands
         return ReadBack(session, chat, target.Name, chatId, messageId, html, target.Mention);
     }
 
-    /// <summary>show: one message, or the newest few, oldest first.</summary>
+    /// <summary>show: one message, or the newest few, oldest first, in a target or any chat by its id.</summary>
     public static int Show(Session session, string targetName, string? messageId, int last)
     {
-        var target = session.Config.TargetNamed(targetName);
-        var chatId = target.ChatId;
+        string chatId;
+        if (targetName.StartsWith("19:", StringComparison.Ordinal))
+        {
+            CheckChatId(targetName);
+            chatId = targetName;
+        }
+        else
+            chatId = session.Config.TargetNamed(targetName).ChatId;
+        var target = new Target(targetName, new ChatDestination(chatId), Mention.None);
         var chat = session.Chat();
         IReadOnlyList<ChatMessage> messages;
         try
@@ -307,7 +320,8 @@ public static partial class Commands
         return 0;
     }
 
-    private static int ReadBack(Session session, TeamsChat chat, string targetName, string chatId, string messageId, string html, Mention mention)
+    private static int ReadBack(Session session, TeamsChat chat, string targetName, string chatId, string messageId, string html, Mention mention,
+        string? quotedId = null)
     {
         ChatMessage? back = null;
         for (var attempt = 1; back is null; attempt++)
@@ -328,6 +342,8 @@ public static partial class Commands
             }
         }
         var problem = Mismatch(html, mention, chatId, back);
+        if (quotedId is not null && !back.Attachments.Any(a => a.Id == quotedId && a.ContentType == "messageReference"))
+            problem = (problem is null ? "" : problem + "; ") + $"the quote of message {quotedId} isn't there";
         if (problem is not null)
         {
             session.Log($"read back {messageId}: different ({problem})");

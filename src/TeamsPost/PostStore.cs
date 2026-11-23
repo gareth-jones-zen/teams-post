@@ -11,6 +11,9 @@ namespace TeamsPost;
 public sealed record PostRecord(string File, string Target, string Chat, string? Id, string? Created, string Sha256,
     string Status, string PostedAt, string? EditedAt = null, string? EditUnknown = null)
 {
+    /// <summary>A reply (Target "(reply)"): the message it quoted, if any.</summary>
+    public string? ReplyTo { get; init; }
+
     public bool Landed => Status == "posted" && !string.IsNullOrEmpty(Id);
 }
 
@@ -56,7 +59,7 @@ public sealed class PostStore(string path)
         {
             string? Text(string key) => item?[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
             records.Add(new PostRecord(Text("file") ?? "", Text("target") ?? "", Text("chat") ?? "", Text("id"), Text("created"),
-                Text("sha256") ?? "", Text("status") ?? "posted", Text("posted_at") ?? "", Text("edited_at"), Text("edit_unknown")));
+                Text("sha256") ?? "", Text("status") ?? "posted", Text("posted_at") ?? "", Text("edited_at"), Text("edit_unknown")) { ReplyTo = Text("reply_to") });
         }
         return records;
     }
@@ -81,6 +84,8 @@ public sealed class PostStore(string path)
                 item["edited_at"] = r.EditedAt;
             if (r.EditUnknown is not null)
                 item["edit_unknown"] = r.EditUnknown;
+            if (r.ReplyTo is not null)
+                item["reply_to"] = r.ReplyTo;
             array.Add((JsonNode)item);
         }
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(Path))!);

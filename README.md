@@ -1,7 +1,8 @@
 # teams-post
 
 Posts a markdown file to a Microsoft Teams chat, reads it back to check it landed, and can edit the
-message later from the same file.
+message later from the same file. It also lists the chats where someone else spoke last, and replies
+in any of your chats from a file, quoting the message it answers.
 
 ```
 teams-post post marketing 2026-11-16.md          # shows the message as it will appear; nothing is sent
@@ -11,10 +12,14 @@ teams-post post marketing 2026-11-16.md --yes
 teams-post edit 2026-11-16.md                    # shows what would change in that message
 teams-post edit 2026-11-16.md --yes
 teams-post show marketing --last 3
+teams-post unanswered --hours 72                 # chats waiting on you (reads only)
+teams-post reply "19:...@unq.gbl.spaces" reply.md --to 1763371234567        # preview
+teams-post reply "19:...@unq.gbl.spaces" reply.md --to 1763371234567 --yes
 ```
 
 It's for messages someone has written and approved as a file (a team update, a reminder with
-@Everyone), where the file is the record and a person decides when it goes.
+@Everyone, a reply drafted for someone to check), where the file is the record and a person decides
+when it goes.
 
 ## Install
 
@@ -36,8 +41,11 @@ asks for each permission only when a command needs it:
 | `post --yes` | `POST /chats/{chat}/messages` | **ChatMessage.Send** |
 | `post --yes`, `edit`, `show` (reading) | `GET /chats/{chat}/messages[/{id}]` | **Chat.Read** (or Chat.ReadWrite) |
 | `edit --yes` | `PATCH /chats/{chat}/messages/{id}` | **Chat.ReadWrite** |
+| `reply --yes` | `POST /chats/{chat}/messages` | **ChatMessage.Send** |
+| `unanswered`, `reply` (reading) | `GET /me/chats`, `GET /chats/{chat}[/members]`, `GET /chats/{chat}/messages` | **Chat.Read** |
+| `unanswered`, `reply` (who you are) | `GET /me` | **User.Read** |
 
-`sign-in` asks for ChatMessage.Send and Chat.Read. Chat.ReadWrite is asked for the first time you
+`sign-in` asks for ChatMessage.Send, Chat.Read and User.Read. Chat.ReadWrite is asked for the first time you
 edit, because it's the only delegated permission Graph accepts for changing a chat message. Many
 organisations need an admin to approve one or more of these: the sign-in shows an "Approval
 required" screen, where you can ask. Only the person who posted a message can edit it.
@@ -75,7 +83,17 @@ chat = "19:...@thread.v2"
 [target.general]
 chat = "19:...@thread.v2"
 mention = "everyone"                # optional: the post starts with @Everyone
+
+[unanswered]                        # optional: what `unanswered` looks at
+hours = 48                          # how far back (the default); or
+# working_days = 2                  # that many working days back (Monday to Friday), not both
+skip_chats = ["19:...@thread.v2", "^Team .* General$"]   # chat ids, or regular expressions (case ignored)
+                                    # matched against the chat's name: its topic, or the other person's name
+skip_senders = ["Workflows", "Some Person"]              # display names (case ignored) or user ids
 ```
+
+`working_days` keeps a Monday morning from missing Friday afternoon: counted back from now, a
+Saturday or Sunday doesn't count (bank holidays do).
 
 A chat's id is in its link in Teams (`.../l/chat/19:...@thread.v2/...`), or Graph's `/me/chats`.
 Paths may use `~` and `%VARIABLES%`; a relative path is relative to the settings file.
@@ -97,16 +115,78 @@ teams-post post <target> <file.md>          show what would be posted (sends not
 teams-post post <target> <file.md> --yes    post it, then read it back
 teams-post edit <file.md>                   show what would change in the message it was posted as
 teams-post edit <file.md> --yes             edit that message, then read it back
-teams-post show <target> [<message id>]     a message, or the newest ones (--last N, default 5, up to 50)
+teams-post show <target> [<message id>]     a message, or the newest ones (--last N, default 5, up to 50);
+                                            a chat id works in place of a target
+teams-post unanswered [--hours N] [--json]  chats where someone else spoke last (reads only)
+teams-post reply <chat id> <file.md>        show the reply that would be sent (sends nothing)
+teams-post reply <chat id> <file.md> --yes  send it into that chat, then read it back
 teams-post --version
 
-    --again                  post: post a file that has already been posted to that target
+    --again                  post, reply: send a file that has already been sent there
     --target T               edit: which target, when the file went to more than one
     --id MESSAGE_ID          edit: a message by its id (with --target), when there's no record of it
+    --to MESSAGE_ID          reply: quote that message, as Teams' own Reply does
+    --hours N                unanswered: look back N hours (1 to 744), instead of [unanswered]
+    --json                   unanswered: as JSON
 ```
 
 **Exit codes:** 0 done; 1 refused or failed (a draft, a second post, a read-back that differs, an
-answer that never came); 2 settings, arguments or sign-in.
+answer that never came, a chat you aren't in); 2 settings, arguments or sign-in.
+
+## Chats waiting on you: `unanswered`
+
+Lists your one-to-one and group chats where the newest message a person wrote is someone else's
+and falls inside the window (48 hours, or `[unanswered]`), newest first. It reads only. It doesn't
+decide what needs an answer: it lists them all, flagged, for you (or an assistant) to judge.
+
+- **Not counted:** system events (someone added, a meeting started), messages from apps and bots,
+  deleted messages, and anyone in `skip_senders`. If one of those is the newest, the message before it decides.
+- **Meeting chats** are listed only when you're @mentioned in the window. Channels aren't looked at.
+- **Flags:** `direct` (a one-to-one), `mentionsYou` (you're @mentioned), `question` (a "?", not
+  counting one inside a link).
+- **For each chat:** its name (topic, or the other person), type, id, the newest five of the
+  messages since yours (oldest first, each as plain text, up to 500 characters), and the id of the
+  newest, for `reply --to`.
+
+```
+Since Fri 13 Nov 10:30 (2 working days): 2 chats where someone else spoke last.
+
+Alex Example  (one-to-one; direct, question)
+  chat 19:..._...@unq.gbl.spaces
+  reply --to 1763371234567
+  Tue 17 Nov 08:55  Alex Example
+    Have you seen the design?
+  Tue 17 Nov 09:00  Alex Example
+    Can you look at this <https://example.com/doc> today?
+
+Design review  (group chat; mentionsYou)
+  ...
+```
+
+`--json` gives the same as one object: `since`, `window`, `chats` (each with `chat`, `title`,
+`chatType`, `flags` {`direct`, `mentionsYou`, `question`}, `replyTo`, `lastAt`, `since` (how many
+messages since yours) and `messages` [{`id`, `from`, `created`, `text`}]), and `unreadable` (chats
+whose messages couldn't be read).
+
+## Replying in a chat: `reply`
+
+Sends a markdown file (the same subset as `post`) into any chat you're in, by its id: a target isn't
+needed. With `--to`, the reply quotes that message the way Teams' own Reply does in a chat: the body
+starts with `<attachment id="<message id>"></attachment>`, with an attachment
+
+```json
+{ "id": "<message id>", "contentType": "messageReference",
+  "content": "{\"messageId\":\"<message id>\",\"messagePreview\":\"<its first 200 characters>\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"userIdentityType\":\"aadUser\",\"tenantId\":\"...\",\"id\":\"<sender's id>\",\"displayName\":\"<sender>\"}}}" }
+```
+
+That's how Teams stores a reply typed by hand.
+
+- **The preview** shows the chat (its topic or the people in it), the message being answered
+  (sender, time, its first 200 characters) and the reply as plain text.
+- **Refused before anything is sent:** a channel's id (`@thread.tacv2`, `@thread.skype`), a chat
+  you can't read or aren't a member of, a `--to` message that isn't in the chat, is deleted or is a
+  system event, and a draft.
+- **A reply can't be edited by teams-post yet** (`edit` says so): edit it in Teams.
 
 ## The markdown it understands
 
@@ -147,27 +227,32 @@ That's exactly how Teams stores an @Everyone typed by hand, so everyone in the c
 
 ## Safety
 
-- **Preview by default.** Without `--yes`, `post` shows the target and the message as plain text
-  (what the chat will show), and `edit` a line diff of the message in Teams against the file.
-  Nothing is sent.
+- **Preview by default.** Without `--yes`, `post` and `reply` show where it's going and the message
+  as plain text (what the chat will show), and `edit` a line diff of the message in Teams against
+  the file. Nothing is sent. `unanswered` and `show` only read.
 - **A file is posted once per target.** Every post is recorded in the state file (the file's full
   path, target, chat, message id, created time and a SHA-256 of the HTML sent). Posting the same file
   to the same target again is refused, with a pointer to `edit`; `--again` posts it anyway. Two runs
   at once wait for each other, so they can't both decide a file hasn't been posted.
+- **A file is sent as a reply once per chat.** A reply is recorded the same way (target `(reply)`,
+  the chat, and the quoted message as `reply_to`); a file already sent to that chat, by `reply` or
+  `post`, is refused unless `--again`.
 - **A change is never sent twice.** A post or an edit is sent again only after a 429 (refused before
   it was looked at) or a connection that never opened. After a timeout, a dropped connection or a
-  5xx it may have been applied, so it isn't resent: the run stops, says so, and exits 1. A post whose
-  answer was lost is recorded as `unknown`, so the next `post` of that file is refused until you've
-  looked (`show`). An edit whose answer was lost is recorded as unconfirmed (`edit_unknown`, the
+  5xx it may have been applied, so it isn't resent: the run stops, says so, and exits 1. A post or reply whose
+  answer was lost is recorded as `unknown`, so the next `post` or `reply` of that file there is
+  refused until you've looked (`show <target or chat id>`). An edit whose answer was lost is recorded as unconfirmed (`edit_unknown`, the
   SHA-256 of what was sent) and `show <target> <id>` tells you whether it landed; the next `edit`
   of that file reads the message first, and if it already reads as the file, records the edit as
   done and sends nothing. A 4xx is a refusal: nothing changed and nothing is recorded. Reads are
   retried after a 429, a 5xx or a dropped connection (three tries in all).
-- **Every post and edit is read back.** The message must have the same number of list items and
-  paragraphs as was sent, and the @Everyone mention when one was sent; otherwise it says what differs
+- **Every post, reply and edit is read back.** The message must have the same number of list items
+  and paragraphs as was sent, the @Everyone mention when one was sent, and a reply's quote when it
+  quoted a message; otherwise it says what differs
   and exits 1. A message just posted can answer "not found" for a moment, so the read waits a few
   seconds for it.
-- **The log** (`log_file`) records each post and edit by target and message id, not the text.
+- **The log** (`log_file`) records each post, reply and edit by target or chat and message id, not
+  the text.
 
 ## Building
 

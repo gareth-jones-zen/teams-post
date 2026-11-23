@@ -9,25 +9,68 @@ namespace TeamsPost;
 public sealed record ChatMessage(string Id, string? Created, string? From, string MessageType, bool Deleted, string Html,
     IReadOnlyList<MentionInfo> Mentions)
 {
+    /// <summary>The sender's user id; null for an app, a bot or a system event.</summary>
+    public string? FromUserId { get; init; }
+
+    /// <summary>Sent by an app or a bot (from.application), not a person.</summary>
+    public bool FromApplication { get; init; }
+
+    /// <summary>The sender as Graph gave it (the "from" object), for quoting the message.</summary>
+    public JsonObject? FromJson { get; init; }
+
+    /// <summary>The attachments' ids and content types (a quoted message is a "messageReference").</summary>
+    public IReadOnlyList<(string? Id, string? ContentType)> Attachments { get; init; } = [];
+
+    /// <summary>A message a person wrote: not a system event, not from an app, not deleted.</summary>
+    public bool ByPerson => MessageType == "message" && !Deleted && !FromApplication && FromUserId is not null;
+
+    public DateTimeOffset? CreatedAt =>
+        DateTimeOffset.TryParse(Created, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AssumeUniversal, out var at) ? at : null;
+
     public static ChatMessage Parse(JsonNode? json)
     {
         var mentions = new List<MentionInfo>();
         if (json?["mentions"] is JsonArray array)
             foreach (var m in array)
                 mentions.Add(new MentionInfo((int?)m?["id"] ?? -1, (string?)m?["mentionText"],
-                    (string?)m?["mentioned"]?["conversation"]?["id"], (string?)m?["mentioned"]?["conversation"]?["conversationIdentityType"]));
+                    (string?)m?["mentioned"]?["conversation"]?["id"], (string?)m?["mentioned"]?["conversation"]?["conversationIdentityType"])
+                {
+                    UserId = (string?)m?["mentioned"]?["user"]?["id"],
+                });
+        var attachments = new List<(string?, string?)>();
+        if (json?["attachments"] is JsonArray items)
+            foreach (var a in items)
+                attachments.Add(((string?)a?["id"], (string?)a?["contentType"]));
+        var from = json?["from"] as JsonObject;
         return new ChatMessage(
             (string?)json?["id"] ?? "",
             (string?)json?["createdDateTime"],
-            (string?)json?["from"]?["user"]?["displayName"] ?? (string?)json?["from"]?["application"]?["displayName"],
+            (string?)from?["user"]?["displayName"] ?? (string?)from?["application"]?["displayName"],
             (string?)json?["messageType"] ?? "message",
-            json?["deletedDateTime"] is JsonValue,
+            json?["deletedDateTime"] is JsonValue || json?["isDeleted"] is JsonValue deleted && deleted.TryGetValue<bool>(out var isDeleted) && isDeleted,
             (string?)json?["body"]?["content"] ?? "",
-            mentions);
+            mentions)
+        {
+            FromUserId = (string?)from?["user"]?["id"],
+            FromApplication = from?["application"] is JsonObject,
+            FromJson = (JsonObject?)from?.DeepClone(),
+            Attachments = attachments,
+        };
     }
 }
 
-public sealed record MentionInfo(int Id, string? Text, string? ConversationId, string? ConversationType);
+public sealed record MentionInfo(int Id, string? Text, string? ConversationId, string? ConversationType)
+{
+    /// <summary>The person mentioned, when it's a person.</summary>
+    public string? UserId { get; init; }
+}
+
+/// <summary>A chat as /me/chats lists it, with its last message's preview (null if it has none).</summary>
+public sealed record ChatSummary(string Id, string? Topic, string ChatType, ChatMessage? Last);
+
+/// <summary>Someone in a chat.</summary>
+public sealed record ChatMember(string? UserId, string? Name);
 
 /// <summary>Graph answered a request with a refusal (4xx): nothing was changed.</summary>
 public sealed class GraphRefusedException(int status, string message) : Exception(message)
@@ -54,9 +97,10 @@ public sealed class TeamsChat(GraphClient graph)
     public static readonly string[] SendScopes = ["ChatMessage.Send"];
     public static readonly string[] ReadScopes = ["Chat.Read"];
     public static readonly string[] EditScopes = ["Chat.ReadWrite"];
+    public static readonly string[] MeScopes = ["User.Read"];
 
-    /// <summary>What sign-in asks for: enough to post and read back.</summary>
-    public static readonly string[] SignInScopes = ["ChatMessage.Send", "Chat.Read"];
+    /// <summary>What sign-in asks for: enough to post, read back, and know who's signed in.</summary>
+    public static readonly string[] SignInScopes = ["ChatMessage.Send", "Chat.Read", "User.Read"];
 
     public GraphClient Graph { get; } = graph;
 
@@ -70,25 +114,67 @@ public sealed class TeamsChat(GraphClient graph)
     public void Edit(string chatId, string messageId, JsonObject payload) =>
         Write(HttpMethod.Patch, $"{Messages(chatId)}/{messageId}", payload, EditScopes);
 
-    public ChatMessage Get(string chatId, string messageId)
-    {
-        try
-        {
-            return ChatMessage.Parse(Graph.GetAsync($"{Messages(chatId)}/{messageId}", ReadScopes).GetAwaiter().GetResult());
-        }
-        catch (GraphRequestException error) when ((int)error.Status is >= 400 and < 500)
-        {
-            throw new GraphRefusedException((int)error.Status, error.Message);
-        }
-    }
+    public ChatMessage Get(string chatId, string messageId) =>
+        ChatMessage.Parse(Read($"{Messages(chatId)}/{messageId}", ReadScopes));
 
     /// <summary>The newest messages, newest first (Graph allows up to 50 at a time).</summary>
     public IReadOnlyList<ChatMessage> Latest(string chatId, int count)
     {
+        var page = Read($"{Messages(chatId)}?$top={count}&$orderby=createdDateTime%20desc", ReadScopes);
+        return page["value"] is JsonArray items ? items.Select(ChatMessage.Parse).ToList() : [];
+    }
+
+    /// <summary>Who's signed in: their user id and name (User.Read).</summary>
+    public (string Id, string? Name) Me()
+    {
+        var me = Read("/me?$select=id,displayName", MeScopes);
+        return ((string?)me["id"] is { Length: > 0 } id ? id : throw new InvalidOperationException("Graph didn't say who's signed in."),
+            (string?)me["displayName"]);
+    }
+
+    /// <summary>The signed-in person's chats, the most recently active first, until (and including) the first whose
+    /// last message is older than since (or has none). At most pages × 50 chats.</summary>
+    public IReadOnlyList<ChatSummary> ChatsSince(DateTimeOffset since, int pages = 20)
+    {
+        var chats = new List<ChatSummary>();
+        string? next = "/me/chats?$expand=lastMessagePreview&$orderby=lastMessagePreview/createdDateTime%20desc&$top=50";
+        for (var page = 0; page < pages && !string.IsNullOrEmpty(next); page++)
+        {
+            var reply = Read(next, ReadScopes);
+            next = (string?)reply["@odata.nextLink"];
+            foreach (var item in reply["value"] as JsonArray ?? [])
+            {
+                var last = item?["lastMessagePreview"] is JsonObject preview ? ChatMessage.Parse(preview) : null;
+                chats.Add(new ChatSummary((string?)item?["id"] ?? "", (string?)item?["topic"], (string?)item?["chatType"] ?? "", last));
+                if (last?.CreatedAt is not { } at || at < since)
+                    return chats;
+            }
+        }
+        return chats;
+    }
+
+    /// <summary>A chat by id: its topic and type. A chat the signed-in person isn't in (or a channel's id) is a
+    /// refusal (GraphRefusedException).</summary>
+    public ChatSummary Chat(string chatId)
+    {
+        var chat = Read($"/chats/{chatId}", ReadScopes);
+        return new ChatSummary((string?)chat["id"] ?? chatId, (string?)chat["topic"], (string?)chat["chatType"] ?? "", null);
+    }
+
+    /// <summary>The people in a chat.</summary>
+    public IReadOnlyList<ChatMember> Members(string chatId)
+    {
+        var reply = Read($"/chats/{chatId}/members", ReadScopes);
+        return (reply["value"] as JsonArray ?? []).Select(m => new ChatMember((string?)m?["userId"], (string?)m?["displayName"])).ToList();
+    }
+
+    /// <summary>A read: retried by M365Graph after a 429, a 5xx or a dropped connection; a 4xx is a
+    /// GraphRefusedException.</summary>
+    private JsonObject Read(string url, string[] scopes)
+    {
         try
         {
-            var page = Graph.GetAsync($"{Messages(chatId)}?$top={count}&$orderby=createdDateTime%20desc", ReadScopes).GetAwaiter().GetResult();
-            return page["value"] is JsonArray items ? items.Select(ChatMessage.Parse).ToList() : [];
+            return Graph.GetAsync(url, scopes).GetAwaiter().GetResult();
         }
         catch (GraphRequestException error) when ((int)error.Status is >= 400 and < 500)
         {

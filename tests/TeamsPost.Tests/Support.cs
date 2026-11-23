@@ -15,7 +15,12 @@ public sealed partial class FakeTeams : HttpMessageHandler
     {
         public required string Id { get; init; }
         public required string Chat { get; init; }
-        public required string Created { get; init; }
+        public required string Created { get; set; }
+        public string From { get; set; } = "Test User";
+        public string FromId { get; set; } = "user-test";
+        public bool App { get; set; }
+        public string MessageType { get; set; } = "message";
+        public JsonArray Attachments { get; set; } = [];
         public string Html { get; set; } = "";
         public JsonArray Mentions { get; set; } = [];
         public bool Deleted { get; set; }
@@ -57,6 +62,45 @@ public sealed partial class FakeTeams : HttpMessageHandler
         token: (scopes, _) => { Scopes.Add(scopes); return Task.FromResult("token"); },
         delay: (_, _) => Task.CompletedTask);
 
+    public const string MeId = "me-id";
+    public const string MeName = "Me Example";
+
+    public sealed class Chat
+    {
+        public required string Id { get; init; }
+        public string Type { get; init; } = "group";
+        public string? Topic { get; init; }
+        public List<(string Id, string Name)> Members { get; init; } = [];
+    }
+
+    public Dictionary<string, Chat> Chats { get; } = [];
+
+    /// <summary>How many chats /me/chats gives per page.</summary>
+    public int ChatPageSize { get; set; } = 50;
+
+    /// <summary>Drops a reply's quote (its attachments) as Teams stores it.</summary>
+    public bool DropAttachments { get; set; }
+
+    public Chat AddChat(string id, string type = "group", string? topic = null, params (string Id, string Name)[] others)
+    {
+        var chat = new Chat { Id = id, Type = type, Topic = topic, Members = [(MeId, MeName), .. others] };
+        Chats[id] = chat;
+        return chat;
+    }
+
+    /// <summary>A message from someone (or from me, with MeId), at a time.</summary>
+    public Message Say(string chat, (string Id, string Name) from, string html, string created, JsonArray? mentions = null)
+    {
+        var message = Add(chat, html, mentions);
+        message.From = from.Name;
+        message.FromId = from.Id;
+        message.Created = created;
+        return message;
+    }
+
+    public static JsonArray MentionOf(string userId, string name) =>
+        [new JsonObject { ["id"] = 0, ["mentionText"] = name, ["mentioned"] = new JsonObject { ["user"] = new JsonObject { ["id"] = userId, ["displayName"] = name } } }];
+
     public Message Add(string chat, string html, JsonArray? mentions = null)
     {
         var message = new Message { Id = (nextId++).ToString(System.Globalization.CultureInfo.InvariantCulture), Chat = chat,
@@ -71,20 +115,84 @@ public sealed partial class FakeTeams : HttpMessageHandler
     private static JsonObject ToJson(Message m) => new()
     {
         ["id"] = m.Id,
-        ["messageType"] = "message",
         ["createdDateTime"] = m.Created,
         ["deletedDateTime"] = m.Deleted ? "2026-11-17T11:00:00Z" : null,
         ["chatId"] = m.Chat,
-        ["from"] = new JsonObject { ["user"] = new JsonObject { ["displayName"] = "Test User" } },
+        ["messageType"] = m.MessageType,
+        ["from"] = From(m),
+        ["attachments"] = m.Attachments.DeepClone(),
         ["body"] = new JsonObject { ["contentType"] = "html", ["content"] = m.Html },
         ["mentions"] = m.Mentions.DeepClone(),
     };
+
+    private static JsonObject? From(Message m) =>
+        m.MessageType != "message" ? null
+        : m.App ? new JsonObject { ["application"] = new JsonObject { ["id"] = m.FromId, ["displayName"] = m.From }, ["device"] = null, ["user"] = null }
+        : new JsonObject
+        {
+            ["application"] = null,
+            ["device"] = null,
+            ["user"] = new JsonObject
+            {
+                ["@odata.type"] = "#microsoft.graph.teamworkUserIdentity", ["id"] = m.FromId, ["displayName"] = m.From,
+                ["userIdentityType"] = "aadUser", ["tenantId"] = "tenant-id",
+            },
+        };
+
+    private IEnumerable<Message> Newest(string chat) =>
+        Messages.Select((m, i) => (m, i)).Where(x => x.m.Chat == chat)
+            .OrderByDescending(x => x.m.Created, StringComparer.Ordinal).ThenByDescending(x => x.i).Select(x => x.m);
+
+    private HttpResponseMessage? Other(HttpRequestMessage request, string path, string query)
+    {
+        if (request.Method != HttpMethod.Get)
+            return null;
+        if (path == "/v1.0/me")
+            return Json(HttpStatusCode.OK, new JsonObject { ["id"] = MeId, ["displayName"] = MeName });
+        if (path == "/v1.0/me/chats")
+        {
+            var skip = Regex.Match(query, @"\$skiptoken=(\d+)") is { Success: true } s ? int.Parse(s.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture) : 0;
+            var ordered = Chats.Values.Select(c => (c, last: Newest(c.Id).FirstOrDefault()))
+                .OrderByDescending(x => x.last?.Created ?? "", StringComparer.Ordinal).ToList();
+            var page = new JsonArray();
+            foreach (var (c, last) in ordered.Skip(skip).Take(ChatPageSize))
+                page.Add((JsonNode)new JsonObject
+                {
+                    ["id"] = c.Id, ["topic"] = c.Topic, ["chatType"] = c.Type,
+                    ["lastMessagePreview"] = last is null ? null : new JsonObject
+                    {
+                        ["id"] = last.Id, ["createdDateTime"] = last.Created, ["isDeleted"] = last.Deleted, ["messageType"] = last.MessageType,
+                        ["body"] = new JsonObject { ["contentType"] = "html", ["content"] = last.Html }, ["from"] = From(last),
+                    },
+                });
+            var reply = new JsonObject { ["value"] = page };
+            if (skip + ChatPageSize < ordered.Count)
+                reply["@odata.nextLink"] = $"https://graph.microsoft.com/v1.0/me/chats?$top=50&$skiptoken={skip + ChatPageSize}";
+            return Json(HttpStatusCode.OK, reply);
+        }
+        var chat = ChatRoute().Match(path);
+        if (!chat.Success)
+            return null;
+        if (!Chats.TryGetValue(chat.Groups[1].Value, out var found))
+            return Json(HttpStatusCode.NotFound, new JsonObject { ["error"] = "no chat (fake)" });
+        if (!chat.Groups[2].Success)
+            return Json(HttpStatusCode.OK, new JsonObject { ["id"] = found.Id, ["topic"] = found.Topic, ["chatType"] = found.Type });
+        var members = new JsonArray();
+        foreach (var (id, name) in found.Members)
+            members.Add((JsonNode)new JsonObject { ["userId"] = id, ["displayName"] = name });
+        return Json(HttpStatusCode.OK, new JsonObject { ["value"] = members });
+    }
+
+    [GeneratedRegex(@"^/v1\.0/chats/([^/]+)(/members)?$")]
+    private static partial Regex ChatRoute();
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancel)
     {
         var body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancel);
         var uri = request.RequestUri!;
         Requests.Add((request.Method.Method, Uri.UnescapeDataString(uri.PathAndQuery), body));
+        if (Other(request, Uri.UnescapeDataString(uri.AbsolutePath), Uri.UnescapeDataString(uri.Query)) is { } other)
+            return other;
         var route = Route().Match(Uri.UnescapeDataString(uri.AbsolutePath));
         if (!route.Success)
             return Json(HttpStatusCode.NotFound, new JsonObject { ["error"] = "no route (fake)" });
@@ -102,7 +210,7 @@ public sealed partial class FakeTeams : HttpMessageHandler
             {
                 var top = int.Parse(Regex.Match(uri.Query, @"\$top=(\d+)").Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
                 var list = new JsonArray();
-                foreach (var m in Messages.Where(m => m.Chat == chat).Reverse().Take(top))
+                foreach (var m in Newest(chat).Take(top))
                     list.Add((JsonNode)ToJson(m));
                 return Json(HttpStatusCode.OK, new JsonObject { ["value"] = list });
             }
@@ -126,6 +234,8 @@ public sealed partial class FakeTeams : HttpMessageHandler
         if (request.Method == HttpMethod.Post && id is null)
         {
             target = Add(chat, "");
+            target.From = MeName;
+            target.FromId = MeId;
             answer = Json(HttpStatusCode.Created, null);
         }
         else if (request.Method == HttpMethod.Patch && id is not null)
@@ -139,6 +249,7 @@ public sealed partial class FakeTeams : HttpMessageHandler
 
         target.Html = Store((string)payload["body"]!["content"]!);
         target.Mentions = DropMentions || payload["mentions"] is not JsonArray mentions ? [] : (JsonArray)mentions.DeepClone();
+        target.Attachments = DropAttachments || payload["attachments"] is not JsonArray attachments ? [] : (JsonArray)attachments.DeepClone();
         if (answer.StatusCode == HttpStatusCode.Created)
             answer = Json(HttpStatusCode.Created, ToJson(target));
         if (LoseNextWrite)

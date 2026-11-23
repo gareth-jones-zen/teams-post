@@ -26,6 +26,44 @@ public enum Mention
     Everyone,
 }
 
+/// <summary>A chat unanswered leaves out: by its id, or a regular expression matched against its name (the topic, or
+/// the other person's name in a one-to-one).</summary>
+public sealed record SkipChat(string? ChatId, Regex? Name)
+{
+    public bool Matches(string chatId, string title) =>
+        ChatId is not null ? string.Equals(ChatId, chatId, StringComparison.OrdinalIgnoreCase) : Name!.IsMatch(title);
+}
+
+/// <summary>[unanswered]: how far back to look (hours, or working days counted back from now, Monday to Friday), and
+/// the chats and senders to leave out (a sender by display name, case ignored, or user id).</summary>
+public sealed record UnansweredSettings
+{
+    public const int DefaultHours = 48;
+
+    public int? Hours { get; init; } = DefaultHours;
+    public int? WorkingDays { get; init; }
+    public IReadOnlyList<SkipChat> SkipChats { get; init; } = [];
+    public IReadOnlyList<string> SkipSenders { get; init; } = [];
+
+    /// <summary>The start of the window: hours back, or that many working days back (same time of day).</summary>
+    public static DateTimeOffset Since(DateTimeOffset now, int? hours, int? workingDays)
+    {
+        if (workingDays is not { } days)
+            return now.AddHours(-(hours ?? DefaultHours));
+        var at = now;
+        for (var counted = 0; counted < days;)
+        {
+            at = at.AddDays(-1);
+            if (at.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday))
+                counted++;
+        }
+        return at;
+    }
+
+    public bool SkipsSender(string? name, string? userId) =>
+        SkipSenders.Any(s => string.Equals(s, name, StringComparison.OrdinalIgnoreCase) || string.Equals(s, userId, StringComparison.OrdinalIgnoreCase));
+}
+
 public sealed record Target(string Name, Destination Destination, Mention Mention)
 {
     /// <summary>The chat id. Throws UsageException for a channel target, which isn't supported yet.</summary>
@@ -71,11 +109,17 @@ public sealed partial class Config
         "# One table per place you post to. The chat id is in the chat's link in Teams (19:...@thread.v2).\n" +
         "# [target.team]\n" +
         "# chat = \"19:0123456789abcdef0123456789abcdef@thread.v2\"\n" +
-        "# mention = \"everyone\"              # optional: start the post with @Everyone\n";
+        "# mention = \"everyone\"              # optional: start the post with @Everyone\n" +
+        "\n" +
+        "# What `unanswered` looks at (all optional).\n" +
+        "# [unanswered]\n" +
+        "# hours = 48                        # how far back; or working_days = 2 (Monday to Friday), not both\n" +
+        "# skip_chats = []                   # chat ids, or regular expressions matched against a chat's name\n" +
+        "# skip_senders = []                 # display names (case ignored) or user ids\n";
 
     /// <summary>Every top-level setting: the strict check's list, and what a base file may supply.</summary>
     public static readonly string[] KnownKeys =
-        ["login_hint", "tenant", "msal_cache", "state_file", "log_file", "draft_marker", "strip_frontmatter", "target"];
+        ["login_hint", "tenant", "msal_cache", "state_file", "log_file", "draft_marker", "strip_frontmatter", "target", "unanswered"];
 
     private static readonly string[] TopKeys = KnownKeys;
 
@@ -90,6 +134,7 @@ public sealed partial class Config
     public string DraftMarker { get; init; } = "[DRAFT]";
     public bool StripFrontmatter { get; init; } = true;
     public IReadOnlyDictionary<string, Target> Targets { get; init; } = new Dictionary<string, Target>();
+    public UnansweredSettings Unanswered { get; init; } = new();
 
     /// <summary>The target by name. Throws UsageException naming the ones there are.</summary>
     public Target TargetNamed(string name) =>
@@ -188,6 +233,63 @@ public sealed partial class Config
                 _ => throw new UsageException($"{full}: strip_frontmatter must be true or false."),
             },
             Targets = targets,
+            Unanswered = raw.TryGetValue("unanswered", out var u) ? ReadUnanswered(full, u) : new UnansweredSettings(),
+        };
+    }
+
+    private static readonly string[] UnansweredKeys = ["hours", "working_days", "skip_chats", "skip_senders"];
+
+    private static UnansweredSettings ReadUnanswered(string file, object? value)
+    {
+        var where = $"{file}: [unanswered]";
+        if (value is not TomlTable table)
+            throw new UsageException($"{where} must be a table.");
+        foreach (var key in table.Keys)
+            if (!UnansweredKeys.Contains(key))
+                throw new UsageException($"{where}: unknown setting '{key}' (known: {string.Join(", ", UnansweredKeys)}).");
+        int? Count(string key, int max)
+        {
+            if (!table.TryGetValue(key, out var v))
+                return null;
+            return v is long n && n >= 1 && n <= max
+                ? (int)n
+                : throw new UsageException($"{where}: {key} must be a whole number from 1 to {max}, not {Describe(v)}.");
+        }
+        IReadOnlyList<string> Strings(string key)
+        {
+            if (!table.TryGetValue(key, out var v))
+                return [];
+            if (v is not TomlArray array || array.Any(item => item is not string { Length: > 0 }))
+                throw new UsageException($"{where}: {key} must be a list of strings, [\"...\", \"...\"].");
+            return array.Cast<string>().ToList();
+        }
+        var hours = Count("hours", 24 * 31);
+        var days = Count("working_days", 20);
+        if (hours is not null && days is not null)
+            throw new UsageException($"{where} has both hours and working_days: give one.");
+        var skipChats = new List<SkipChat>();
+        foreach (var entry in Strings("skip_chats"))
+        {
+            if (entry.StartsWith("19:", StringComparison.Ordinal) && PathSafe().IsMatch(entry))
+            {
+                skipChats.Add(new SkipChat(entry, null));
+                continue;
+            }
+            try
+            {
+                skipChats.Add(new SkipChat(null, new Regex(entry, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1))));
+            }
+            catch (ArgumentException error)
+            {
+                throw new UsageException($"{where}: skip_chats \"{entry}\" isn't a chat id (19:...) or a regular expression: {error.Message}");
+            }
+        }
+        return new UnansweredSettings
+        {
+            Hours = hours ?? (days is null ? UnansweredSettings.DefaultHours : null),
+            WorkingDays = days,
+            SkipChats = skipChats,
+            SkipSenders = Strings("skip_senders"),
         };
     }
 

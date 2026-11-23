@@ -35,28 +35,36 @@ public static class Cli
     public const string Prog = "teams-post";
 
     private const string Usage =
-        "usage: teams-post [-h] [--version] [--config CONFIG] {config,sign-in,post,edit,show} ...";
+        "usage: teams-post [-h] [--version] [--config CONFIG] {config,sign-in,post,edit,show,unanswered,reply} ...";
 
     // Explicit "\n" throughout (a raw literal would take the .cs file's line endings).
     public const string Help =
         Usage + "\n\n" +
-        "teams-post: post a markdown file to a Microsoft Teams chat, read it back, and edit it later.\n\n" +
+        "teams-post: post a markdown file to a Microsoft Teams chat, read it back, and edit it later; list the chats\n" +
+        "waiting on you, and reply in one.\n\n" +
         "    teams-post config                           create the settings file (if missing) and say where it is\n" +
         "    teams-post sign-in                          sign in to Microsoft (once; opens a browser)\n" +
         "    teams-post post <target> <file.md>          show what would be posted (sends nothing)\n" +
         "    teams-post post <target> <file.md> --yes    post it, then read it back\n" +
         "    teams-post edit <file.md>                   show what would change in the message it was posted as\n" +
         "    teams-post edit <file.md> --yes             edit that message, then read it back\n" +
-        "    teams-post show <target> [<message id>]     a message, or the newest ones (--last N, default 5)\n\n" +
-        "        --again                  post: post a file that has already been posted to that target\n" +
+        "    teams-post show <target> [<message id>]     a message, or the newest ones (--last N, default 5);\n" +
+        "                                                a chat id works in place of a target\n" +
+        "    teams-post unanswered [--hours N] [--json]  chats where someone else spoke last (reads only)\n" +
+        "    teams-post reply <chat id> <file.md>        show the reply that would be sent (sends nothing)\n" +
+        "    teams-post reply <chat id> <file.md> --yes  send it into that chat, then read it back\n\n" +
+        "        --again                  post, reply: send a file that has already been sent there\n" +
         "        --target T               edit: which target, when the file went to more than one\n" +
-        "        --id MESSAGE_ID          edit: a message by its id (with --target), when there's no record\n\n" +
+        "        --id MESSAGE_ID          edit: a message by its id (with --target), when there's no record\n" +
+        "        --to MESSAGE_ID          reply: quote that message, as Teams' own Reply does\n" +
+        "        --hours N                unanswered: look back N hours (default: [unanswered], else 48)\n" +
+        "        --json                   unanswered: as JSON\n\n" +
         "options:\n" +
         "  -h, --help       show this help message and exit\n" +
         "  --version        show program's version number and exit\n" +
         "  --config CONFIG  settings file (default %APPDATA%\\teams-post\\config.toml)\n";
 
-    private static readonly string[] Commands = ["config", "sign-in", "post", "edit", "show"];
+    private static readonly string[] Commands = ["config", "sign-in", "post", "edit", "show", "unanswered", "reply"];
 
     public static string Version =>
         typeof(Cli).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "0.0.0";
@@ -65,7 +73,9 @@ public static class Cli
     {
         public string? Config;
         public string Command = "";
-        public bool Yes, Again;
+        public bool Yes, Again, Json;
+        public int? Hours;
+        public string? Chat, To;
         public string? Target, File, Id;
         public int Last = 5;
     }
@@ -136,14 +146,21 @@ public static class Cli
                     return TeamsPost.Commands.Post(session, options.Target!, options.File!, false, options.Again);
                 case "edit" when !options.Yes:
                     return TeamsPost.Commands.Edit(session, options.File!, false, options.Target, options.Id);
+                case "unanswered":
+                    return TeamsPost.Commands.Unanswered(session, options.Hours, options.Json);
+                case "reply" when !options.Yes:
+                    return TeamsPost.Commands.Reply(session, options.Chat!, options.File!, options.To, false, options.Again);
             }
             // A post or an edit for real: one at a time, so two runs can't both decide a file hasn't been posted yet.
             using (host.RunLock($"teams-post-run-{Locks.Key(config.StateFile)}", 120)
                    ?? throw new TimeoutException("Another teams-post run didn't finish within 2 minutes."))
             {
-                return options.Command == "post"
-                    ? TeamsPost.Commands.Post(session, options.Target!, options.File!, true, options.Again)
-                    : TeamsPost.Commands.Edit(session, options.File!, true, options.Target, options.Id);
+                return options.Command switch
+                {
+                    "post" => TeamsPost.Commands.Post(session, options.Target!, options.File!, true, options.Again),
+                    "reply" => TeamsPost.Commands.Reply(session, options.Chat!, options.File!, options.To, true, options.Again),
+                    _ => TeamsPost.Commands.Edit(session, options.File!, true, options.Target, options.Id),
+                };
             }
         }
         catch (RefusedException error)
@@ -216,10 +233,10 @@ public static class Cli
                 case (_, "-h" or "--help"):
                     host.Out.Write(Help);
                     return null;
-                case ("post" or "edit", "--yes"):
+                case ("post" or "edit" or "reply", "--yes"):
                     options.Yes = true;
                     break;
-                case ("post", "--again"):
+                case ("post" or "reply", "--again"):
                     options.Again = true;
                     break;
                 case ("edit", "--target"):
@@ -227,6 +244,19 @@ public static class Cli
                     break;
                 case ("edit", "--id"):
                     options.Id = Value(name, ref i, arg);
+                    break;
+                case ("reply", "--to"):
+                    options.To = Value(name, ref i, arg);
+                    break;
+                case ("unanswered", "--json"):
+                    options.Json = true;
+                    break;
+                case ("unanswered", "--hours"):
+                    var hoursText = Value(name, ref i, arg);
+                    if (!int.TryParse(hoursText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var hours)
+                        || hours is < 1 or > 744)
+                        throw new ArgumentsException($"argument --hours: expected a number from 1 to 744, not '{hoursText}'");
+                    options.Hours = hours;
                     break;
                 case ("show", "--last"):
                     var text = Value(name, ref i, arg);
@@ -265,6 +295,10 @@ public static class Cli
                 options.Target = Take("target");
                 if (positional.Count > 0)
                     options.Id = Take("id");
+                break;
+            case "reply":
+                options.Chat = Take("chat id, file");
+                options.File = Take("file");
                 break;
         }
         if (positional.Count > 0)
