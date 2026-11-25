@@ -69,8 +69,21 @@ public sealed record MentionInfo(int Id, string? Text, string? ConversationId, s
 /// <summary>A chat as /me/chats lists it, with its last message's preview (null if it has none).</summary>
 public sealed record ChatSummary(string Id, string? Topic, string ChatType, ChatMessage? Last);
 
-/// <summary>Someone in a chat.</summary>
-public sealed record ChatMember(string? UserId, string? Name);
+/// <summary>Someone in a chat: their user id and name, and (Graph's aadUserConversationMember) email and home tenant.</summary>
+public sealed record ChatMember(string? UserId, string? Name)
+{
+    public string? Email { get; init; }
+    public string? TenantId { get; init; }
+}
+
+/// <summary>A file uploaded for a chat: its drive item id and name, the GUID from its eTag (a reference attachment's
+/// id) and its WebDAV URL (the attachment's contentUrl), as Microsoft's "send a message with a file attachment"
+/// example takes them.</summary>
+public sealed record DriveFile(string ItemId, string Name, string AttachmentId, string ContentUrl, long Size);
+
+/// <summary>Attaching a file needs Files.ReadWrite, and no sign-in holds it (never asked for, refused, or waiting
+/// for an admin's approval). Nothing was uploaded or sent.</summary>
+public sealed class FilesConsentException(string message, Exception? inner = null) : Exception(message, inner);
 
 /// <summary>Graph answered a request with a refusal (4xx): nothing was changed.</summary>
 public sealed class GraphRefusedException(int status, string message) : Exception(message)
@@ -92,11 +105,18 @@ public sealed class DeliveryUnknownException(string message, Exception? inner = 
 /// been applied, so it's never resent: M365Graph throws GraphDeliveryUnknownException, which becomes
 /// DeliveryUnknownException. A 4xx is a refusal (GraphRefusedException): nothing changed. Reads (GET) are retried
 /// on a 429, a 5xx or a dropped connection.</summary>
-public sealed class TeamsChat(GraphClient graph)
+public sealed partial class TeamsChat(GraphClient graph)
 {
     public static readonly string[] SendScopes = ["ChatMessage.Send"];
     public static readonly string[] ReadScopes = ["Chat.Read"];
     public static readonly string[] EditScopes = ["Chat.ReadWrite"];
+
+    /// <summary>Uploading a file to the signed-in person's OneDrive and sharing it (post --attach): asked for only
+    /// when first needed, as editing's Chat.ReadWrite is.</summary>
+    public static readonly string[] FileScopes = ["Files.ReadWrite"];
+
+    /// <summary>The folder in a person's OneDrive where Teams keeps the files they attach in chats.</summary>
+    public const string ChatFilesFolder = "Microsoft Teams Chat Files";
     public static readonly string[] MeScopes = ["User.Read"];
 
     /// <summary>What sign-in asks for: enough to post, read back, and know who's signed in.</summary>
@@ -165,7 +185,81 @@ public sealed class TeamsChat(GraphClient graph)
     public IReadOnlyList<ChatMember> Members(string chatId)
     {
         var reply = Read($"/chats/{chatId}/members", ReadScopes);
-        return (reply["value"] as JsonArray ?? []).Select(m => new ChatMember((string?)m?["userId"], (string?)m?["displayName"])).ToList();
+        return (reply["value"] as JsonArray ?? []).Select(m => new ChatMember((string?)m?["userId"], (string?)m?["displayName"])
+        {
+            Email = (string?)m?["email"] is { Length: > 0 } email ? email : null,
+            TenantId = (string?)m?["tenantId"],
+        }).ToList();
+    }
+
+    /// <summary>A Files.ReadWrite token, or FilesConsentException: checked before anything is uploaded, so a missing
+    /// consent stops the run with nothing changed. A browser opens to ask only if someone's at the console, as for
+    /// every other scope.</summary>
+    public void RequireFiles()
+    {
+        try
+        {
+            Graph.TokenAsync(FileScopes).GetAwaiter().GetResult();
+        }
+        catch (SignInNeededException error)
+        {
+            throw new FilesConsentException(
+                "Attaching a file needs the Files.ReadWrite permission (to upload it to your OneDrive and share it with the "
+                + $"chat's members), and no sign-in holds it. {error.Message}\n"
+                + "At a console, run: teams-post sign-in --files. If it shows \"Approval required\", an admin has to approve it.",
+                error);
+        }
+    }
+
+    /// <summary>Uploads a file to the signed-in person's "Microsoft Teams Chat Files" folder (replacing one of the same
+    /// name, so a run that stopped part-way can simply be run again), then reads what a reference attachment needs.
+    /// A PUT of the same content changes nothing the second time, so it's retried as M365Graph retries any PUT.</summary>
+    public DriveFile Upload(string name, byte[] content)
+    {
+        var url = $"/me/drive/root:/{Uri.EscapeDataString(ChatFilesFolder)}/{Uri.EscapeDataString(name)}:/content";
+        var uploaded = Send(HttpMethod.Put, url, content, "application/octet-stream", GraphRetryPolicy.For(HttpMethod.Put), FileScopes);
+        var id = (string?)uploaded?["id"] is { Length: > 0 } itemId ? itemId
+            : throw new InvalidOperationException("OneDrive didn't say what the uploaded file's id is.");
+        var item = Read($"/me/drive/items/{id}?$select=id,name,eTag,webDavUrl,size", FileScopes);
+        var etag = (string?)item["eTag"] ?? "";
+        var guid = GuidIn().Match(etag);
+        if (!guid.Success)
+            throw new InvalidOperationException($"The uploaded file's eTag ({etag}) has no GUID to attach it by.");
+        var webDav = (string?)item["webDavUrl"] is { Length: > 0 } dav ? dav
+            : throw new InvalidOperationException("OneDrive didn't give the uploaded file's webDavUrl.");
+        return new DriveFile(id, (string?)item["name"] ?? name, guid.Value.ToLowerInvariant(), webDav, (long?)item["size"] ?? content.Length);
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex("[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")]
+    private static partial System.Text.RegularExpressions.Regex GuidIn();
+
+    /// <summary>Shares the file with these people by name, read-only and without an email (driveItem invite:
+    /// requireSignIn, sendInvitation false, roles read): never a link that anyone, or the whole organisation, can open.
+    /// Sent once, as every write is. Returns who it couldn't be shared with (a 207 says per person); empty if everyone.</summary>
+    public IReadOnlyList<string> Share(string itemId, IReadOnlyList<ChatMember> people)
+    {
+        var recipients = new JsonArray();
+        foreach (var person in people)
+            recipients.Add((JsonNode)(person.Email is { } email
+                ? new JsonObject { ["email"] = email }
+                : new JsonObject { ["objectId"] = person.UserId }));
+        var payload = new JsonObject
+        {
+            ["recipients"] = recipients,
+            ["requireSignIn"] = true,
+            ["sendInvitation"] = false,
+            ["roles"] = new JsonArray("read"),
+        };
+        var reply = Write(HttpMethod.Post, $"/me/drive/items/{itemId}/invite", payload, FileScopes);
+        var granted = reply?["value"] as JsonArray ?? [];
+        var failed = new List<string>();
+        for (var i = 0; i < people.Count; i++)
+        {
+            var permission = i < granted.Count ? granted[i] : null;
+            if (permission is null || permission["error"] is JsonObject)
+                failed.Add(people[i].Name ?? people[i].Email ?? people[i].UserId ?? "?");
+        }
+        return failed;
     }
 
     /// <summary>A read: retried by M365Graph after a 429, a 5xx or a dropped connection; a 4xx is a
@@ -183,12 +277,14 @@ public sealed class TeamsChat(GraphClient graph)
     }
 
     private JsonNode? Write(HttpMethod method, string url, JsonObject payload, string[] scopes)
+        => Send(method, url, Encoding.UTF8.GetBytes(payload.ToJsonString()), "application/json", GraphRetryPolicy.Write, scopes);
+
+    private JsonNode? Send(HttpMethod method, string url, byte[] body, string contentType, GraphRetryPolicy policy, string[] scopes)
     {
         GraphRawResponse reply;
         try
         {
-            reply = Graph.SendRawAsync(method, url, Encoding.UTF8.GetBytes(payload.ToJsonString()), "application/json",
-                GraphRetryPolicy.Write, scopes).GetAwaiter().GetResult();
+            reply = Graph.SendRawAsync(method, url, body, contentType, policy, scopes).GetAwaiter().GetResult();
         }
         catch (GraphDeliveryUnknownException error)
         {

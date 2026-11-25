@@ -59,7 +59,13 @@ public sealed partial class FakeTeams : HttpMessageHandler
     private static partial Regex Route();
 
     public GraphClient Client() => new(new GraphClientOptions { Log = _ => { } }, this,
-        token: (scopes, _) => { Scopes.Add(scopes); return Task.FromResult("token"); },
+        token: (scopes, _) =>
+        {
+            Scopes.Add(scopes);
+            if (RefuseFiles && scopes.Contains("Files.ReadWrite"))
+                throw new SignInNeededException("No cached sign-in for Files.ReadWrite, or it has expired. (fake)");
+            return Task.FromResult("token");
+        },
         delay: (_, _) => Task.CompletedTask);
 
     public const string MeId = "me-id";
@@ -179,7 +185,11 @@ public sealed partial class FakeTeams : HttpMessageHandler
             return Json(HttpStatusCode.OK, new JsonObject { ["id"] = found.Id, ["topic"] = found.Topic, ["chatType"] = found.Type });
         var members = new JsonArray();
         foreach (var (id, name) in found.Members)
-            members.Add((JsonNode)new JsonObject { ["userId"] = id, ["displayName"] = name });
+            members.Add((JsonNode)new JsonObject
+            {
+                ["userId"] = id, ["displayName"] = name, ["email"] = EmailOf(name),
+                ["tenantId"] = Outsiders.Contains(id) ? "other-tenant" : "tenant-id",
+            });
         return Json(HttpStatusCode.OK, new JsonObject { ["value"] = members });
     }
 
@@ -191,6 +201,8 @@ public sealed partial class FakeTeams : HttpMessageHandler
         var body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancel);
         var uri = request.RequestUri!;
         Requests.Add((request.Method.Method, Uri.UnescapeDataString(uri.PathAndQuery), body));
+        if (Drive(request, Uri.UnescapeDataString(uri.AbsolutePath), body) is { } drive)
+            return drive;
         if (Other(request, Uri.UnescapeDataString(uri.AbsolutePath), Uri.UnescapeDataString(uri.Query)) is { } other)
             return other;
         var route = Route().Match(Uri.UnescapeDataString(uri.AbsolutePath));
@@ -270,7 +282,80 @@ public sealed partial class FakeTeams : HttpMessageHandler
         return answer;
     }
 
-    public int Writes => Requests.Count(r => r.Method is "POST" or "PATCH");
+    public int Writes => Requests.Count(r => r.Method is "POST" or "PATCH" or "PUT");
+
+    // ---------------------------------------------------------------- OneDrive, for post --attach
+
+    /// <summary>The signed-in person's sign-in doesn't hold Files.ReadWrite (never consented, or refused).</summary>
+    public bool RefuseFiles { get; set; }
+
+    /// <summary>Members (by user id) whose home tenant isn't the signed-in person's.</summary>
+    public HashSet<string> Outsiders { get; } = [];
+
+    /// <summary>Emails the invite gives an error for (a 207).</summary>
+    public HashSet<string> ShareFails { get; } = [];
+
+    /// <summary>Files in the signed-in person's OneDrive, by item id: their path and content.</summary>
+    public Dictionary<string, (string Path, byte[] Content)> Files { get; } = [];
+
+    /// <summary>Each invite's item id and body.</summary>
+    public List<(string Item, JsonNode Body)> Invites { get; } = [];
+
+    public static string EmailOf(string name) => name.ToLowerInvariant().Replace(' ', '.') + "@example.com";
+
+    public static string GuidOf(string itemId) => $"{int.Parse(itemId[5..], System.Globalization.CultureInfo.InvariantCulture):D8}-AAAA-BBBB-CCCC-0123456789AB";
+
+    [GeneratedRegex(@"^/v1\.0/me/drive/root:/(.+):/content$")]
+    private static partial Regex UploadRoute();
+
+    [GeneratedRegex(@"^/v1\.0/me/drive/items/([^/]+)(/invite)?$")]
+    private static partial Regex ItemRoute();
+
+    private HttpResponseMessage? Drive(HttpRequestMessage request, string path, string? body)
+    {
+        if (UploadRoute().Match(path) is { Success: true } upload && request.Method == HttpMethod.Put)
+        {
+            var at = upload.Groups[1].Value;
+            var id = Files.FirstOrDefault(f => f.Value.Path == at).Key ?? $"item-{Files.Count + 1}";
+            Files[id] = (at, request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult());
+            return Json(HttpStatusCode.Created, new JsonObject { ["id"] = id, ["name"] = at[(at.LastIndexOf('/') + 1)..] });
+        }
+        if (ItemRoute().Match(path) is not { Success: true } item)
+            return null;
+        var itemId = item.Groups[1].Value;
+        if (!Files.TryGetValue(itemId, out var file))
+            return Json(HttpStatusCode.NotFound, new JsonObject { ["error"] = "no item (fake)" });
+        if (request.Method == HttpMethod.Get && !item.Groups[2].Success)
+            return Json(HttpStatusCode.OK, new JsonObject
+            {
+                ["id"] = itemId,
+                ["name"] = file.Path[(file.Path.LastIndexOf('/') + 1)..],
+                ["eTag"] = $"\"{{{GuidOf(itemId)}}},1\"",
+                ["webDavUrl"] = "https://example-my.sharepoint.com/personal/me_example_com/Documents/" + file.Path,
+                ["size"] = file.Content.Length,
+            });
+        if (request.Method == HttpMethod.Post && item.Groups[2].Success)
+        {
+            var invite = JsonNode.Parse(body!)!;
+            Invites.Add((itemId, invite));
+            var value = new JsonArray();
+            var partial = false;
+            foreach (var recipient in invite["recipients"]!.AsArray())
+            {
+                var email = (string?)recipient!["email"];
+                var permission = new JsonObject { ["id"] = $"perm-{value.Count}", ["roles"] = new JsonArray("read"),
+                    ["invitation"] = new JsonObject { ["email"] = email, ["signInRequired"] = true } };
+                if (email is not null && ShareFails.Contains(email))
+                {
+                    permission["error"] = new JsonObject { ["code"] = "notAllowed", ["message"] = "not allowed (fake)" };
+                    partial = true;
+                }
+                value.Add((JsonNode)permission);
+            }
+            return Json(partial ? HttpStatusCode.MultiStatus : HttpStatusCode.OK, new JsonObject { ["value"] = value });
+        }
+        return Json(HttpStatusCode.MethodNotAllowed, null);
+    }
 }
 
 /// <summary>A temporary folder with settings, a message file and a fake Teams; runs the command line against them.</summary>
@@ -304,6 +389,7 @@ public sealed class Env : IDisposable
     public StringWriter Out { get; private set; } = new();
     public StringWriter Err { get; private set; } = new();
     public List<TimeSpan> Waits { get; } = [];
+    public List<string> SignIns { get; } = [];
 
     public string Combine(params string[] parts) => Path.Combine([Folder, .. parts]);
 
@@ -326,7 +412,8 @@ public sealed class Env : IDisposable
             Err = Err,
             Env = Variable,
             Graph = _ => client,
-            SignIn = _ => { },
+            SignIn = _ => SignIns.Add("sign-in"),
+            SignInFiles = _ => SignIns.Add("sign-in --files"),
             Now = () => new DateTimeOffset(2026, 11, 17, 10, 30, 0, TimeSpan.Zero),
             Wait = Waits.Add,
             RunLock = (_, _) => new Nothing(),

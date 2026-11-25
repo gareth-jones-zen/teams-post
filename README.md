@@ -1,8 +1,9 @@
 # teams-post
 
 Posts a markdown file to a Microsoft Teams chat, reads it back to check it landed, and can edit the
-message later from the same file. It also lists the chats where someone else spoke last, and replies
-in any of your chats from a file, quoting the message it answers.
+message later from the same file. It also lists the chats where someone else spoke last, replies
+in any of your chats from a file, quoting the message it answers, and posts into any of your chats
+by its id with a file attached, shared with the chat's members by name.
 
 ```
 teams-post post marketing 2026-11-16.md          # shows the message as it will appear; nothing is sent
@@ -15,6 +16,7 @@ teams-post show marketing --last 3
 teams-post unanswered --hours 72                 # chats waiting on you (reads only)
 teams-post reply "19:...@unq.gbl.spaces" reply.md --to 1763371234567        # preview
 teams-post reply "19:...@unq.gbl.spaces" reply.md --to 1763371234567 --yes
+teams-post post --chat "19:meeting_...@thread.v2" note.md --attach transcript.md --yes
 ```
 
 It's for messages someone has written and approved as a file (a team update, a reminder with
@@ -44,11 +46,19 @@ asks for each permission only when a command needs it:
 | `reply --yes` | `POST /chats/{chat}/messages` | **ChatMessage.Send** |
 | `unanswered`, `reply` (reading) | `GET /me/chats`, `GET /chats/{chat}[/members]`, `GET /chats/{chat}/messages` | **Chat.Read** |
 | `unanswered`, `reply` (who you are) | `GET /me` | **User.Read** |
+| `post --chat --yes` | `POST /chats/{chat}/messages` | **ChatMessage.Send** |
+| `post --chat` (reading) | `GET /chats/{chat}[/members]`, `GET /me`, `GET /chats/{chat}/messages/{id}` | **Chat.Read**, **User.Read** |
+| `post --chat --attach --yes` (the file) | `PUT /me/drive/root:/Microsoft Teams Chat Files/{name}:/content`, `GET /me/drive/items/{id}`, `POST /me/drive/items/{id}/invite` | **Files.ReadWrite** |
 
 `sign-in` asks for ChatMessage.Send, Chat.Read and User.Read. Chat.ReadWrite is asked for the first time you
-edit, because it's the only delegated permission Graph accepts for changing a chat message. Many
-organisations need an admin to approve one or more of these: the sign-in shows an "Approval
+edit, because it's the only delegated permission Graph accepts for changing a chat message.
+**Files.ReadWrite** is asked for the first time you attach a file (at a console), or ahead of time with
+`teams-post sign-in --files`: it's the least Graph accepts for uploading to your OneDrive and sharing the file.
+Many organisations need an admin to approve one or more of these: the sign-in shows an "Approval
 required" screen, where you can ask. Only the person who posted a message can edit it.
+
+**Without Files.ReadWrite, `--attach --yes` exits 3** with nothing uploaded or sent (run unattended, it never opens a
+browser to ask), so whatever runs it can hold the post back and say why.
 
 ## Sharing settings with other tools: `base`
 
@@ -110,9 +120,13 @@ supported yet: it needs ChannelMessage.Send, which isn't in use yet.
 
 ```
 teams-post config                           create the settings file (if missing) and say where it is
-teams-post sign-in                          sign in to Microsoft (once; opens a browser)
+teams-post sign-in [--files]                sign in to Microsoft (once; opens a browser); --files also asks
+                                            for Files.ReadWrite, which post --attach needs
 teams-post post <target> <file.md>          show what would be posted (sends nothing)
 teams-post post <target> <file.md> --yes    post it, then read it back
+teams-post post --chat <chat id> <file.md> [--attach FILE] [--yes]
+                                            the same, into any chat you're in, by its id; --attach uploads
+                                            a file and shares it with the chat's members
 teams-post edit <file.md>                   show what would change in the message it was posted as
 teams-post edit <file.md> --yes             edit that message, then read it back
 teams-post show <target> [<message id>]     a message, or the newest ones (--last N, default 5, up to 50);
@@ -126,12 +140,18 @@ teams-post --version
     --target T               edit: which target, when the file went to more than one
     --id MESSAGE_ID          edit: a message by its id (with --target), when there's no record of it
     --to MESSAGE_ID          reply: quote that message, as Teams' own Reply does
+    --chat CHAT_ID           post: to this chat (one you're in) instead of a target
+    --attach FILE            post --chat: attach this file (up to 4 MB)
+    --name NAME              post --attach: the name it's uploaded and shown as (default: the file's own)
+    --external               post --attach: share it with members outside your organisation too
     --hours N                unanswered: look back N hours (1 to 744), instead of [unanswered]
     --json                   unanswered: as JSON
 ```
 
 **Exit codes:** 0 done; 1 refused or failed (a draft, a second post, a read-back that differs, an
-answer that never came, a chat you aren't in); 2 settings, arguments or sign-in.
+answer that never came, a chat you aren't in, a member outside your organisation without
+`--external`); 2 settings, arguments or sign-in; 3 `--attach` needs Files.ReadWrite, which no sign-in holds
+(nothing was uploaded or sent).
 
 ## Chats waiting on you: `unanswered`
 
@@ -188,6 +208,40 @@ That's how Teams stores a reply typed by hand.
   system event, and a draft.
 - **A reply can't be edited by teams-post yet** (`edit` says so): edit it in Teams.
 
+## Posting into any chat, with a file: `post --chat`
+
+`post --chat <chat id> <file.md>` posts the file into any chat you're in (a meeting's chat, say) without a target in
+the settings and without quoting anything. It has the same preview without `--yes`, the same read-back, and the same
+once-per-chat record as `reply` (target `(chat)`); `edit` changes it later from the same file, as a target's post.
+
+**`--attach <file>`** adds a file, the way Teams' own attachments work:
+
+1. **Uploaded to your OneDrive's "Microsoft Teams Chat Files" folder**, where Teams keeps the files you attach in chats,
+   under `--name` or the file's own name (a file there of that name is replaced, so a run that stopped part-way can be
+   run again).
+2. **Shared with the chat's members by name**: a driveItem invite to each of them (their email address, or their user
+   id), read-only, sign-in required and no email sent. **Never a link** that anyone, or everyone in the organisation,
+   could open. Teams' own app shares a chat file with the members by itself; through Graph it has to be done
+   explicitly, or they'd see the file and get "access denied".
+3. **Posted with a `reference` attachment**, as Microsoft's "send a message with a file attachment" example has it:
+   the body ends `<attachment id="<GUID from the file's eTag>"></attachment>`, with
+
+```json
+"attachments": [{ "id": "<the same GUID>", "contentType": "reference",
+  "contentUrl": "<the file's webDavUrl>", "name": "<its name>" }]
+```
+
+4. **Read back:** the message must have the attachment too.
+
+- **The preview** says the file's name and size, and who it would be shared with.
+- **Someone outside your organisation** (a member whose home tenant isn't yours, or with no user id) is refused, in the
+  preview too, unless `--external`.
+- **Nothing is posted unless everyone has the file**: if the upload or the share fails, or the share fails for anyone
+  (Graph's 207), it stops before the message is sent. The file may then be in your OneDrive; running it again
+  uploads and shares it again.
+- **A post with a file isn't edited** by teams-post (`edit` says so): edit it in Teams.
+- Up to 4 MB (one upload).
+
 ## The markdown it understands
 
 A deliberate small subset, so what you see in the file is what the chat shows:
@@ -236,7 +290,8 @@ That's exactly how Teams stores an @Everyone typed by hand, so everyone in the c
   at once wait for each other, so they can't both decide a file hasn't been posted.
 - **A file is sent as a reply once per chat.** A reply is recorded the same way (target `(reply)`,
   the chat, and the quoted message as `reply_to`); a file already sent to that chat, by `reply` or
-  `post`, is refused unless `--again`.
+  `post`, is refused unless `--again`. So is a `post --chat` (target `(chat)`, with the attached file's OneDrive
+  item and name as `attachment` and `attachment_name`).
 - **A change is never sent twice.** A post or an edit is sent again only after a 429 (refused before
   it was looked at) or a connection that never opened. After a timeout, a dropped connection or a
   5xx it may have been applied, so it isn't resent: the run stops, says so, and exits 1. A post or reply whose
@@ -251,8 +306,8 @@ That's exactly how Teams stores an @Everyone typed by hand, so everyone in the c
   quoted a message; otherwise it says what differs
   and exits 1. A message just posted can answer "not found" for a moment, so the read waits a few
   seconds for it.
-- **The log** (`log_file`) records each post, reply and edit by target or chat and message id, not
-  the text.
+- **The log** (`log_file`) records each post, reply and edit by target or chat and message id (and an
+  attached file's name), not the text.
 
 ## Building
 
@@ -264,6 +319,7 @@ dotnet test -c Release
 dotnet publish src/TeamsPost.Console -c Release -r win-x64 -o out
 ```
 
-The tests run the real Graph client against a fake Teams behind a fake HTTP handler, which can lose
-an answer, fail a write or store a message differently from how it was sent. A tag `v*` builds and
+The tests run the real Graph client against a fake Teams (and OneDrive) behind a fake HTTP handler, which can lose
+an answer, fail a write, refuse Files.ReadWrite, fail a share for someone, or store a message differently from how it
+was sent. Nothing is ever posted, uploaded or shared for real. A tag `v*` builds and
 publishes a release.

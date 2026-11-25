@@ -14,6 +14,10 @@ public sealed record PostRecord(string File, string Target, string Chat, string?
     /// <summary>A reply (Target "(reply)"): the message it quoted, if any.</summary>
     public string? ReplyTo { get; init; }
 
+    /// <summary>A post with a file attached (post --chat --attach): the file's OneDrive item id and name.</summary>
+    public string? Attachment { get; init; }
+    public string? AttachmentName { get; init; }
+
     public bool Landed => Status == "posted" && !string.IsNullOrEmpty(Id);
 }
 
@@ -59,7 +63,12 @@ public sealed class PostStore(string path)
         {
             string? Text(string key) => item?[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
             records.Add(new PostRecord(Text("file") ?? "", Text("target") ?? "", Text("chat") ?? "", Text("id"), Text("created"),
-                Text("sha256") ?? "", Text("status") ?? "posted", Text("posted_at") ?? "", Text("edited_at"), Text("edit_unknown")) { ReplyTo = Text("reply_to") });
+                Text("sha256") ?? "", Text("status") ?? "posted", Text("posted_at") ?? "", Text("edited_at"), Text("edit_unknown"))
+            {
+                ReplyTo = Text("reply_to"),
+                Attachment = Text("attachment"),
+                AttachmentName = Text("attachment_name"),
+            });
         }
         return records;
     }
@@ -86,6 +95,10 @@ public sealed class PostStore(string path)
                 item["edit_unknown"] = r.EditUnknown;
             if (r.ReplyTo is not null)
                 item["reply_to"] = r.ReplyTo;
+            if (r.Attachment is not null)
+                item["attachment"] = r.Attachment;
+            if (r.AttachmentName is not null)
+                item["attachment_name"] = r.AttachmentName;
             array.Add((JsonNode)item);
         }
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(Path))!);

@@ -17,6 +17,9 @@ public sealed class CliHost
     /// <summary>Sign in, interactively.</summary>
     public Action<Config> SignIn { get; init; } = Cli.SignIn;
 
+    /// <summary>Sign in, interactively, asking for Files.ReadWrite too (sign-in --files).</summary>
+    public Action<Config> SignInFiles { get; init; } = Cli.SignInFiles;
+
     public Func<DateTimeOffset> Now { get; init; } = () => DateTimeOffset.Now;
     public Action<TimeSpan> Wait { get; init; } = wait => Thread.Sleep(wait);
 
@@ -29,7 +32,8 @@ public sealed class CliHost
 }
 
 /// <summary>teams-post: post a markdown file to a Teams chat, read it back, and edit it later. Exit codes: 0 done;
-/// 1 refused or failed; 2 settings, arguments or sign-in.</summary>
+/// 1 refused or failed; 2 settings, arguments or sign-in; 3 attaching a file needs Files.ReadWrite, which no
+/// sign-in holds.</summary>
 public static class Cli
 {
     public const string Prog = "teams-post";
@@ -43,9 +47,13 @@ public static class Cli
         "teams-post: post a markdown file to a Microsoft Teams chat, read it back, and edit it later; list the chats\n" +
         "waiting on you, and reply in one.\n\n" +
         "    teams-post config                           create the settings file (if missing) and say where it is\n" +
-        "    teams-post sign-in                          sign in to Microsoft (once; opens a browser)\n" +
+        "    teams-post sign-in [--files]                sign in to Microsoft (once; opens a browser); --files also\n" +
+        "                                                asks for Files.ReadWrite, which post --attach needs\n" +
         "    teams-post post <target> <file.md>          show what would be posted (sends nothing)\n" +
         "    teams-post post <target> <file.md> --yes    post it, then read it back\n" +
+        "    teams-post post --chat <chat id> <file.md> [--attach FILE] [--yes]\n" +
+        "                                                the same, into any chat you're in, by its id; --attach\n" +
+        "                                                uploads a file and shares it with the chat's members\n" +
         "    teams-post edit <file.md>                   show what would change in the message it was posted as\n" +
         "    teams-post edit <file.md> --yes             edit that message, then read it back\n" +
         "    teams-post show <target> [<message id>]     a message, or the newest ones (--last N, default 5);\n" +
@@ -57,12 +65,17 @@ public static class Cli
         "        --target T               edit: which target, when the file went to more than one\n" +
         "        --id MESSAGE_ID          edit: a message by its id (with --target), when there's no record\n" +
         "        --to MESSAGE_ID          reply: quote that message, as Teams' own Reply does\n" +
+        "        --chat CHAT_ID           post: to this chat (one you're in) instead of a target\n" +
+        "        --attach FILE            post --chat: attach this file (up to 4 MB), shared with the chat's members by name\n" +
+        "        --name NAME              post --attach: the name it's uploaded and shown as (default: the file's own)\n" +
+        "        --external               post --attach: share it with members outside your organisation too\n" +
         "        --hours N                unanswered: look back N hours (default: [unanswered], else 48)\n" +
         "        --json                   unanswered: as JSON\n\n" +
         "options:\n" +
         "  -h, --help       show this help message and exit\n" +
         "  --version        show program's version number and exit\n" +
-        "  --config CONFIG  settings file (default %APPDATA%\\teams-post\\config.toml)\n";
+        "  --config CONFIG  settings file (default %APPDATA%\\teams-post\\config.toml)\n\n" +
+        "exit codes: 0 done; 1 refused or failed; 2 settings, arguments or sign-in; 3 --attach needs Files.ReadWrite\n";
 
     private static readonly string[] Commands = ["config", "sign-in", "post", "edit", "show", "unanswered", "reply"];
 
@@ -73,7 +86,8 @@ public static class Cli
     {
         public string? Config;
         public string Command = "";
-        public bool Yes, Again, Json;
+        public bool Yes, Again, Json, External, Files;
+        public string? Attach, AttachName;
         public int? Hours;
         public string? Chat, To;
         public string? Target, File, Id;
@@ -94,6 +108,24 @@ public static class Cli
 
     public static void SignIn(Config config) =>
         GraphFor(config).TokenAsync(TeamsChat.SignInScopes, true).GetAwaiter().GetResult();
+
+    /// <summary>sign-in --files: the usual permissions, then Files.ReadWrite (asked for on its own, so a refusal of it
+    /// leaves the rest signed in).</summary>
+    public static void SignInFiles(Config config)
+    {
+        var graph = GraphFor(config);
+        graph.TokenAsync(TeamsChat.SignInScopes, true).GetAwaiter().GetResult();
+        try
+        {
+            graph.TokenAsync(TeamsChat.FileScopes, true).GetAwaiter().GetResult();
+        }
+        catch (SignInNeededException error)
+        {
+            throw new FilesConsentException($"Files.ReadWrite wasn't granted: {error.Message}\n"
+                + "If the sign-in showed \"Approval required\", ask your admin to approve Files.ReadWrite (delegated) for "
+                + "Microsoft Graph Command Line Tools; post --attach can't share files until then.", error);
+        }
+    }
 
     public static int Run(IReadOnlyList<string> argv, CliHost? host = null)
     {
@@ -124,10 +156,14 @@ public static class Cli
             var log = Logger.Create(config.LogFile);
             if (options.Command == "sign-in")
             {
-                host.SignIn(config);
-                host.Out.WriteLine("Signed in.");
+                if (options.Files)
+                    host.SignInFiles(config);
+                else
+                    host.SignIn(config);
+                host.Out.WriteLine(options.Files ? "Signed in, with Files.ReadWrite." : "Signed in.");
                 return 0;
             }
+            var attach = options.Attach is null ? null : new AttachRequest(options.Attach, options.AttachName, options.External);
             GraphClient? graph = null;
             var session = new Session
             {
@@ -142,6 +178,8 @@ public static class Cli
             {
                 case "show":
                     return TeamsPost.Commands.Show(session, options.Target!, options.Id, options.Last);
+                case "post" when !options.Yes && options.Chat is not null:
+                    return TeamsPost.Commands.PostToChat(session, options.Chat, options.File!, attach, false, options.Again);
                 case "post" when !options.Yes:
                     return TeamsPost.Commands.Post(session, options.Target!, options.File!, false, options.Again);
                 case "edit" when !options.Yes:
@@ -157,6 +195,7 @@ public static class Cli
             {
                 return options.Command switch
                 {
+                    "post" when options.Chat is not null => TeamsPost.Commands.PostToChat(session, options.Chat, options.File!, attach, true, options.Again),
                     "post" => TeamsPost.Commands.Post(session, options.Target!, options.File!, true, options.Again),
                     "reply" => TeamsPost.Commands.Reply(session, options.Chat!, options.File!, options.To, true, options.Again),
                     _ => TeamsPost.Commands.Edit(session, options.File!, true, options.Target, options.Id),
@@ -167,6 +206,11 @@ public static class Cli
         {
             host.Err.WriteLine(error.Message);
             return 1;
+        }
+        catch (FilesConsentException error)
+        {
+            host.Err.WriteLine(error.Message);
+            return 3;
         }
         catch (Exception error) when (error is UsageException or SignInNeededException)
         {
@@ -248,6 +292,21 @@ public static class Cli
                 case ("reply", "--to"):
                     options.To = Value(name, ref i, arg);
                     break;
+                case ("post", "--chat"):
+                    options.Chat = Value(name, ref i, arg);
+                    break;
+                case ("post", "--attach"):
+                    options.Attach = Value(name, ref i, arg);
+                    break;
+                case ("post", "--name"):
+                    options.AttachName = Value(name, ref i, arg);
+                    break;
+                case ("post", "--external"):
+                    options.External = true;
+                    break;
+                case ("sign-in", "--files"):
+                    options.Files = true;
+                    break;
                 case ("unanswered", "--json"):
                     options.Json = true;
                     break;
@@ -284,7 +343,12 @@ public static class Cli
 
         switch (options.Command)
         {
+            case "post" when options.Chat is not null:
+                options.File = Take("file");
+                break;
             case "post":
+                if (options.Attach is not null || options.AttachName is not null || options.External)
+                    throw new ArgumentsException("--attach, --name and --external go with --chat <chat id>");
                 options.Target = Take("target, file");
                 options.File = Take("file");
                 break;
@@ -303,6 +367,8 @@ public static class Cli
         }
         if (positional.Count > 0)
             throw new ArgumentsException($"unrecognized arguments: {string.Join(" ", positional)}");
+        if (options.Attach is null && (options.AttachName is not null || options.External))
+            throw new ArgumentsException("--name and --external go with --attach");
         return options;
     }
 }

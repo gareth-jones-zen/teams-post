@@ -183,11 +183,18 @@ public static partial class Commands
                     : $"No record of {full} being posted{(targetName is null ? "" : $" to {targetName}")}. If it was, use --target and --id.");
                 return 1;
             }
-            var targets = landed.Select(r => r.Target).Distinct().ToList();
+            var targets = landed.Select(r => r.Target == ChatTarget ? r.Chat : r.Target).Distinct().ToList();
             if (targets.Count > 1)
                 throw new UsageException($"{full} was posted to {string.Join(" and ", targets)}: say which with --target.");
             record = landed[^1];
-            target = config.TargetNamed(record.Target);
+            if (record.Attachment is not null)
+            {
+                session.Out.WriteLine($"{full} was posted with a file attached ({record.AttachmentName}), and teams-post doesn't edit those: edit it in Teams.");
+                return 1;
+            }
+            target = record.Target == ChatTarget
+                ? new Target(ChatTarget, new ChatDestination(record.Chat), Mention.None)
+                : config.TargetNamed(record.Target);
             messageId = record.Id!;
         }
 
@@ -321,7 +328,7 @@ public static partial class Commands
     }
 
     private static int ReadBack(Session session, TeamsChat chat, string targetName, string chatId, string messageId, string html, Mention mention,
-        string? quotedId = null)
+        string? quotedId = null, string? attachmentId = null)
     {
         ChatMessage? back = null;
         for (var attempt = 1; back is null; attempt++)
@@ -344,6 +351,8 @@ public static partial class Commands
         var problem = Mismatch(html, mention, chatId, back);
         if (quotedId is not null && !back.Attachments.Any(a => a.Id == quotedId && a.ContentType == "messageReference"))
             problem = (problem is null ? "" : problem + "; ") + $"the quote of message {quotedId} isn't there";
+        if (attachmentId is not null && !back.Attachments.Any(a => a.Id == attachmentId && a.ContentType == "reference"))
+            problem = (problem is null ? "" : problem + "; ") + "the attached file isn't there";
         if (problem is not null)
         {
             session.Log($"read back {messageId}: different ({problem})");
